@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.dockerignore
+.gitattributes
+secrets.env
+secrets.env.example
+deploy.sh
+vps/
+README.md
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

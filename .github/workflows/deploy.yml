@@ -1,0 +1,81 @@
+name: Test y deploy al VPS
+
+# No hace falta tocar nada de este archivo al estrenar un repo: el nombre del
+# proyecto que se le manda al VPS sale solo del nombre del repositorio.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:        # botón para desplegar a mano desde GitHub
+
+concurrency: deploy-${{ github.repository }}-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: La imagen construye y el servicio arranca
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Aquí es donde van los tests del proyecto, si los tiene. Por ejemplo:
+      #   - uses: actions/setup-python@v7
+      #     with: { python-version: "3.11", cache: pip }
+      #   - run: pip install -r requirements-dev.txt
+      #   - run: python -m pytest -q
+
+      - name: Construir y arrancar
+        run: |
+          docker build -t ci-imagen:test .
+          docker run -d --name ci-contenedor --network host ci-imagen:test
+
+      - name: Responde al healthcheck
+        run: |
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8000/healthz || true)"
+            if [ "$code" != "000" ]; then
+              echo "El servicio responde (HTTP $code)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::El servicio no respondió en 30 s"
+          docker logs ci-contenedor
+          exit 1
+
+  deploy:
+    name: Desplegar en el VPS
+    needs: test             # si los tests fallan, no se despliega
+    # is_template evita que la plantilla se despliegue a sí misma. En un repo
+    # creado a partir de ella es false, así que no hay que quitar nada.
+    if: github.event_name != 'pull_request' && !github.event.repository.is_template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Unirse a Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Preparar SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      # La clave tiene comando forzado: lo único que llega al VPS es el nombre
+      # del repositorio, y el despachador se encarga del resto.
+      - name: Desplegar
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=20 "$VPS_USER@$VPS_HOST" "${{ github.event.repository.name }}"
