@@ -26,13 +26,18 @@ CREATE TABLE hevy_sets (id INTEGER PRIMARY KEY AUTOINCREMENT, workout_id TEXT, d
 CREATE TABLE garmin_daily (date TEXT PRIMARY KEY, sleep_score INTEGER, sleep_hours REAL,
     hrv_avg REAL, resting_hr INTEGER, body_battery_max INTEGER, steps INTEGER, stress_avg INTEGER);
 INSERT INTO garmin_daily (date, steps) VALUES ('2020-01-01', 1234);
+INSERT INTO garmin_daily (date) VALUES ('2020-01-02');
+CREATE TABLE cardio_activities (activity_id TEXT PRIMARY KEY, date TEXT, sport_type TEXT);
+INSERT INTO cardio_activities VALUES ('999', '2026-10-01', 'running');
 """
 
 
-def workout(wid, title, start, ejercicios):
-    return {"id": wid, "title": title, "start_time": start, "end_time": start, "exercises": [
+def workout(wid, title, start, ejercicios, end=None, warmup=0):
+    """Entreno con la forma de la API de Hevy. Las `warmup` primeras series de cada
+    ejercicio son de calentamiento."""
+    return {"id": wid, "title": title, "start_time": start, "end_time": end or start, "exercises": [
         {"index": i, "title": t, "exercise_template_id": f"T{i}", "sets": [
-            {"index": j, "type": "normal", "weight_kg": kg, "reps": reps, "rpe": None,
+            {"index": j, "type": "warmup" if j < warmup else "normal", "weight_kg": kg, "reps": reps, "rpe": None,
              "distance_meters": None, "duration_seconds": None}
             for j, (kg, reps) in enumerate(series)
         ]} for i, (t, series) in enumerate(ejercicios)
@@ -57,6 +62,9 @@ def main() -> int:
     check("exercise_index" in cols, "hevy_sets vacía se recrea con el esquema nuevo")
     viejo = db.fetch_all("SELECT steps, body_battery_min FROM garmin_daily WHERE date = '2020-01-01'")
     check(viejo == [{"steps": 1234, "body_battery_min": None}], "garmin_daily con datos conserva filas y gana columnas")
+    tablas = {r["name"] for r in db.fetch_all("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")}
+    check("cardio_activities" not in tablas and {"garmin_activities", "hevy_workouts", "sesiones_fuerza"} <= tablas,
+          "cardio_activities desaparece; llegan garmin_activities, hevy_workouts y la vista")
 
     # --- Hevy: el mismo ejercicio dos veces en un entreno no debe chocar en el UNIQUE
     w1 = workout("w1", "Pierna", "2026-11-15T23:30:00Z", [
@@ -80,6 +88,23 @@ def main() -> int:
     hevy.apply_events([{"type": "deleted", "id": "w2", "deleted_at": "2026-11-16T10:00:00Z"}])
     n = db.fetch_all("SELECT COUNT(*) n FROM hevy_sets WHERE workout_id = 'w2'")[0]["n"]
     check(n == 0, "un entreno borrado en Hevy se borra de la BD")
+    ids = [r["workout_id"] for r in db.fetch_all("SELECT workout_id FROM hevy_workouts")]
+    check(ids == ["w1"], "hevy_workouts sigue las altas y los borrados")
+
+    # Entreno de gimnasio que también se grabó en Garmin (ver FakeGarmin más abajo).
+    # Hevy da "+00:00"; se guarda normalizado a Z para compararlo con Garmin.
+    w3 = workout("w3", "Push", "2026-11-01T17:02:00+00:00", [
+        ("Bench Press (Barbell)", [(40, 10), (80, 5), (80, 5)]),
+    ], end="2026-11-01T18:05:00+00:00", warmup=1)
+    hevy.apply_events([{"type": "updated", "workout": w3}])
+    fila = db.fetch_all("SELECT start_time, end_time, duration_min FROM hevy_workouts WHERE workout_id = 'w3'")[0]
+    check(fila == {"start_time": "2026-11-01T17:02:00Z", "end_time": "2026-11-01T18:05:00Z", "duration_min": 63.0},
+          "hevy_workouts: inicio y fin en UTC con Z, y duración")
+
+    with db.connect(readonly=False) as conn:
+        conn.execute("DELETE FROM hevy_workouts")
+    check(hevy._faltan_workouts(), "series sin hevy_workouts → la próxima pasada rehace el historial")
+    hevy.apply_events([{"type": "updated", "workout": w1}, {"type": "updated", "workout": w3}])
 
     # --- Garmin: cliente falso con la forma de las respuestas de garminconnect
     class FakeGarmin:
@@ -96,18 +121,34 @@ def main() -> int:
             return {"hrvSummary": {"lastNightAvg": 62}}
 
         def get_activities_by_date(self, a, b):
+            self.desde_actividades = a
             return [
                 {"activityId": 111, "activityName": "Rodaje", "startTimeLocal": "2026-11-01 07:10:00",
-                 "activityType": {"typeKey": "running"}, "duration": 2700.0, "distance": 8123.4,
-                 "averageHR": 148.6, "maxHR": 171.0, "calories": 600.0, "elevationGain": 55.0},
+                 "startTimeGMT": "2026-11-01 06:10:00",
+                 "activityType": {"typeKey": "running"}, "duration": 2700.0, "elapsedDuration": 2700.0,
+                 "distance": 8123.4, "averageHR": 148.6, "maxHR": 171.0, "calories": 600.0, "elevationGain": 55.0},
+                # Calentamiento en cinta que acaba justo cuando empieza la fuerza: está dentro
+                # del margen, pero se solapa menos que la actividad de fuerza.
+                {"activityId": 333, "activityName": "Cinta", "startTimeLocal": "2026-11-01 17:45:00",
+                 "startTimeGMT": "2026-11-01 16:45:00",
+                 "activityType": {"typeKey": "treadmill_running"}, "duration": 900.0, "elapsedDuration": 900.0},
+                # El reloj se arrancó 2 min antes que Hevy y se paró 5 min después.
                 {"activityId": 222, "activityName": "Fuerza", "startTimeLocal": "2026-11-01 18:00:00",
-                 "activityType": {"typeKey": "strength_training"}, "duration": 3600.0},
+                 "startTimeGMT": "2026-11-01 17:00:00",
+                 "activityType": {"typeKey": "strength_training"}, "duration": 3500.0, "elapsedDuration": 4200.0,
+                 "averageHR": 112.4, "maxHR": 158.0, "calories": 450.0},
             ]
 
-    garmin.client = lambda interactive=False: FakeGarmin()
+    fake = FakeGarmin()
+    garmin.client = lambda interactive=False: fake
     garmin.PAUSE_S = 0
-    for _ in range(2):  # dos veces: el upsert no debe duplicar
+    for vuelta in range(2):  # dos veces: el upsert no debe duplicar
         r = garmin.sync(since="2026-11-01")
+        if vuelta == 0:
+            check(fake.desde_actividades == "2020-01-01",
+                  "con garmin_activities vacía, las actividades se bajan desde el primer día de garmin_daily")
+    check(not db.fetch_all("SELECT 1 FROM garmin_daily WHERE date = '2020-01-02'"),
+          "los días sin ningún dato (antes de tener reloj) se limpian")
     dias = db.fetch_all("SELECT * FROM garmin_daily WHERE date >= '2026-11-01' ORDER BY date")
     check(len(dias) == r["days"] and r["days"] >= 2, f"Garmin: una fila por día, sin duplicados ({r['days']})")
     d1 = dias[0]
@@ -116,10 +157,31 @@ def main() -> int:
     check(d1["stress_avg"] is None, "estrés -1 (sin datos) se guarda como NULL")
     check(dias[1]["hrv_avg"] is None and dias[1]["sleep_score"] == 81,
           "si falla una métrica, el resto del día se guarda")
-    act = db.fetch_all("SELECT * FROM cardio_activities")
-    check(len(act) == 1 and act[0]["sport_type"] == "running", "la fuerza de Garmin no entra en cardio")
-    check((act[0]["duration_min"], act[0]["distance_km"], act[0]["avg_hr"]) == (45.0, 8.123, 149),
+    act = {a["activity_id"]: a for a in db.fetch_all("SELECT * FROM garmin_activities")}
+    check(set(act) == {"111", "222", "333"}, "se guardan todas las actividades, también la fuerza")
+    run = act["111"]
+    check((run["duration_min"], run["distance_km"], run["avg_hr"]) == (45.0, 8.123, 149),
           "actividad: minutos, km y pulso bien convertidos")
+    check((act["222"]["start_time_utc"], act["222"]["end_time_utc"]) == ("2026-11-01T17:00:00Z", "2026-11-01T18:10:00Z"),
+          "actividad: inicio UTC y fin con la duración total (pausas incluidas)")
+
+    # --- Cruce Hevy-Garmin
+    pareja = db.fetch_all("SELECT workout_id, garmin_activity_id FROM hevy_workouts ORDER BY workout_id")
+    check(pareja == [{"workout_id": "w1", "garmin_activity_id": None},
+                     {"workout_id": "w3", "garmin_activity_id": "222"}],
+          "el entreno de Hevy se empareja con la fuerza de Garmin, no con la cinta; sin solape, NULL")
+    sesion = db.fetch_all("SELECT * FROM sesiones_fuerza WHERE workout_id = 'w3'")[0]
+    check((sesion["series"], sesion["volumen_kg"], sesion["avg_hr"], sesion["calories"]) == (2, 800.0, 112, 450.0),
+          "sesiones_fuerza: series y volumen de Hevy (sin calentamiento) con pulso y calorías de Garmin")
+
+    # Si se borra el entreno en Hevy, la actividad de Garmin queda libre
+    hevy.apply_events([{"type": "deleted", "id": "w3"}])
+    from ingest import link
+    link.link()
+    check(db.fetch_all("SELECT COUNT(*) n FROM sesiones_fuerza")[0]["n"] == 1, "borrar en Hevy quita la sesión")
+
+    r = garmin.sync(since="2026-11-10", solo_actividades=True)
+    check(r["days"] == 0 and r["activities"] == 3, "--solo-actividades no pide el resumen diario")
 
     estado = {r["source"]: r for r in db.fetch_all("SELECT * FROM sync_state")}
     check(estado["garmin"]["last_error"] is None and estado["garmin"]["cursor"], "sync_state apunta la pasada de Garmin")

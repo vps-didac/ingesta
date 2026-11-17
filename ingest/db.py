@@ -48,12 +48,29 @@ CREATE TABLE IF NOT EXISTS garmin_daily (
     synced_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS cardio_activities (
+-- Una fila por entreno de Hevy. garmin_activity_id la rellena ingest/link.py: la
+-- actividad de Garmin que más se solapa en el tiempo (pulso y calorías del entreno).
+CREATE TABLE IF NOT EXISTS hevy_workouts (
+    workout_id TEXT PRIMARY KEY,
+    date TEXT,                    -- fecha local (TZ) del inicio
+    start_time TEXT,              -- UTC, YYYY-MM-DDTHH:MM:SSZ
+    end_time TEXT,                -- UTC, YYYY-MM-DDTHH:MM:SSZ
+    duration_min REAL,
+    title TEXT,
+    garmin_activity_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hevy_workouts_date ON hevy_workouts(date);
+
+-- Todas las actividades de Garmin, también las de fuerza (de esas interesan pulso y
+-- calorías; las series salen de Hevy).
+CREATE TABLE IF NOT EXISTS garmin_activities (
     activity_id TEXT PRIMARY KEY,
-    date TEXT,
-    start_time TEXT,              -- hora local de Garmin
+    date TEXT,                    -- fecha local
+    start_time TEXT,              -- hora local de Garmin, YYYY-MM-DD HH:MM:SS
+    start_time_utc TEXT,          -- UTC, YYYY-MM-DDTHH:MM:SSZ
+    end_time_utc TEXT,            -- inicio + duración total (incluye pausas)
     name TEXT,
-    sport_type TEXT,
+    sport_type TEXT,              -- running, cycling, strength_training...
     duration_min REAL,
     distance_km REAL,
     avg_hr INTEGER,
@@ -62,7 +79,7 @@ CREATE TABLE IF NOT EXISTS cardio_activities (
     elevation_gain_m REAL,
     tss REAL
 );
-CREATE INDEX IF NOT EXISTS idx_cardio_date ON cardio_activities(date);
+CREATE INDEX IF NOT EXISTS idx_garmin_activities_date ON garmin_activities(date);
 
 -- Estado de cada ingesta: cursor para la siguiente pasada y último resultado.
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -74,6 +91,29 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_rows INTEGER
 );
 """
+
+# Las vistas se rehacen en cada arranque: así un cambio aquí se aplica sin migraciones.
+VIEWS = """
+DROP VIEW IF EXISTS sesiones_fuerza;
+CREATE VIEW sesiones_fuerza AS
+SELECT w.workout_id, w.date, w.start_time, w.title, w.duration_min,
+       s.ejercicios, s.series, s.volumen_kg,
+       g.activity_id AS garmin_activity_id, g.sport_type AS garmin_sport_type,
+       g.avg_hr, g.max_hr, g.calories
+FROM hevy_workouts w
+LEFT JOIN (
+    SELECT workout_id,
+           COUNT(DISTINCT exercise_index) AS ejercicios,
+           SUM(set_type != 'warmup') AS series,
+           ROUND(SUM(CASE WHEN set_type != 'warmup' THEN weight_kg * reps END), 1) AS volumen_kg
+    FROM hevy_sets GROUP BY workout_id
+) s ON s.workout_id = w.workout_id
+LEFT JOIN garmin_activities g ON g.activity_id = w.garmin_activity_id;
+"""
+
+# Tablas que ya no existen en SCHEMA. Solo guardaban datos que se vuelven a bajar de
+# la fuente (garmin_activities se rellena sola si está vacía), así que se borran.
+LEGACY_TABLES = ("cardio_activities",)
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
@@ -109,6 +149,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 log.warning("Añadiendo la columna %s.%s", tabla, nombre)
                 conn.execute(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")
     ref.close()
+    for tabla in LEGACY_TABLES:
+        if _columns(conn, tabla):
+            log.warning("Borrando la tabla antigua %s (se sustituye y se vuelve a descargar)", tabla)
+            conn.execute(f"DROP TABLE {tabla}")
 
 
 def init_schema() -> None:
@@ -116,6 +160,7 @@ def init_schema() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         _migrate(conn)
         conn.executescript(SCHEMA)
+        conn.executescript(VIEWS)
 
 
 @contextmanager

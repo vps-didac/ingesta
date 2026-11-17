@@ -4,7 +4,7 @@ La clave se crea en https://hevy.com/settings?developer y va en HEVY_API_KEY.
 
 Sincronización incremental con /v1/workouts/events: devuelve los entrenos creados o
 editados ("updated", con el entreno completo) y los borrados ("deleted") desde una fecha.
-Cada entreno editado se reescribe entero (se borran sus series y se insertan de nuevo),
+Cada entreno (hevy_workouts) editado se reescribe entero (se borran sus series y se insertan de nuevo),
 así una serie quitada en la app también desaparece de la BD. La primera vez el cursor
 es 1970 y llega todo el historial.
 """
@@ -16,6 +16,7 @@ import requests
 
 from ingest import db
 from ingest.common import TZ, IngestError, get_cursor, iso, log, now_utc, record_run
+from ingest.link import safe_link
 
 SOURCE = "hevy"
 BASE_URL = os.environ.get("HEVY_BASE_URL", "https://api.hevyapp.com")
@@ -65,11 +66,24 @@ def fetch_events(session: requests.Session, since: str) -> list[dict]:
     return eventos
 
 
+def _parse(ts: str | None) -> datetime | None:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+
+
 def _local_date(start_time: str | None) -> str | None:
-    if not start_time:
-        return None
-    dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-    return dt.astimezone(TZ).date().isoformat()
+    dt = _parse(start_time)
+    return dt.astimezone(TZ).date().isoformat() if dt else None
+
+
+def workout_row(w: dict) -> tuple:
+    """Fila de hevy_workouts. Horas normalizadas a UTC con Z, comparables con Garmin."""
+    inicio, fin = _parse(w.get("start_time")), _parse(w.get("end_time"))
+    return (
+        w["id"], _local_date(w.get("start_time")),
+        iso(inicio) if inicio else None, iso(fin) if fin else None,
+        round((fin - inicio).total_seconds() / 60, 1) if inicio and fin else None,
+        w.get("title"),
+    )
 
 
 def workout_rows(w: dict) -> list[tuple]:
@@ -95,6 +109,15 @@ INSERT INTO hevy_sets (workout_id, date, start_time, workout_title, exercise_ind
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
+# Sin tocar garmin_activity_id: lo recalcula ingest/link.py al final de la pasada.
+UPSERT_WORKOUT = """
+INSERT INTO hevy_workouts (workout_id, date, start_time, end_time, duration_min, title)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(workout_id) DO UPDATE SET
+    date = excluded.date, start_time = excluded.start_time, end_time = excluded.end_time,
+    duration_min = excluded.duration_min, title = excluded.title
+"""
+
 
 def apply_events(eventos: list[dict]) -> dict:
     """Aplica los eventos en una sola transacción. Devuelve un resumen."""
@@ -103,9 +126,11 @@ def apply_events(eventos: list[dict]) -> dict:
         for ev in eventos:
             if ev.get("type") == "deleted":
                 conn.execute("DELETE FROM hevy_sets WHERE workout_id = ?", (ev["id"],))
+                conn.execute("DELETE FROM hevy_workouts WHERE workout_id = ?", (ev["id"],))
                 resumen["deleted"] += 1
             elif ev.get("type") == "updated" and ev.get("workout"):
                 w = ev["workout"]
+                conn.execute(UPSERT_WORKOUT, workout_row(w))
                 conn.execute("DELETE FROM hevy_sets WHERE workout_id = ?", (w["id"],))
                 filas = workout_rows(w)
                 conn.executemany(INSERT_SET, filas)
@@ -117,6 +142,9 @@ def apply_events(eventos: list[dict]) -> dict:
 def sync(full: bool = False) -> dict:
     """Trae de Hevy lo nuevo desde la última pasada (o todo con full=True)."""
     inicio = now_utc()
+    if not full and _faltan_workouts():
+        log.warning("hevy_workouts está vacía pero hay series: se rehace el historial completo")
+        full = True
     cursor = None if full else get_cursor(SOURCE)
     since = cursor or "1970-01-01T00:00:00Z"
     try:
@@ -129,4 +157,13 @@ def sync(full: bool = False) -> dict:
         raise
     record_run(SOURCE, cursor=iso(inicio - OVERLAP), rows=resumen["sets"])
     log.info("Hevy desde %s: %s", since, resumen)
+    safe_link()
     return resumen
+
+
+def _faltan_workouts() -> bool:
+    """Series sin entrenos: BD de antes de existir hevy_workouts. Se arregla sola."""
+    with db.connect(readonly=False) as conn:
+        hay_series = conn.execute("SELECT 1 FROM hevy_sets LIMIT 1").fetchone()
+        hay_workouts = conn.execute("SELECT 1 FROM hevy_workouts LIMIT 1").fetchone()
+    return bool(hay_series) and not hay_workouts

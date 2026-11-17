@@ -8,8 +8,9 @@ resto de proyectos del VPS (creado desde `plantilla-vps`).
 ```
 ingest/
 ├── db.py          # esquema de la BD + migración. Este repo es su dueño.
-├── hevy.py        # API oficial de Hevy → hevy_sets
-├── garmin.py      # garminconnect → garmin_daily + cardio_activities
+├── hevy.py        # API oficial de Hevy → hevy_workouts + hevy_sets
+├── garmin.py      # garminconnect → garmin_daily + garmin_activities (todas)
+├── link.py        # cruza cada entreno de Hevy con su actividad de Garmin por hora
 ├── common.py      # zona horaria, sync_state
 └── __main__.py    # CLI: python -m ingest ...
 scripts/test_ingest.py   # CI: la ingesta escribe bien, sin red
@@ -34,9 +35,23 @@ Si cambias una tabla en `ingest/db.py`, actualiza la docstring de `query_persona
 - **Garmin**: no hay API pública para particulares; se usa
   [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) 0.3.x, que se
   autentica como la app de Android. Cada pasada repasa los últimos días (el sueño y el HRV
-  se completan con retraso) y las actividades del mismo rango, salvo las de fuerza, que ya
-  vienen de Hevy. **Es la pieza frágil**: si Garmin cambia el login, se rompe hasta que
-  salga una versión nueva de la librería. Se arregla subiéndola en `requirements.txt`.
+  se completan con retraso) y todas las actividades del mismo rango. Los días sin ningún
+  dato (sin reloj) no se guardan. **Es la pieza frágil**: si Garmin cambia el login, se
+  rompe hasta que salga una versión nueva de la librería. Se arregla subiéndola en
+  `requirements.txt`.
+
+### Gimnasio: Hevy + Garmin
+
+Los entrenos de fuerza se graban en los dos sitios con papeles distintos: **Hevy** tiene
+los ejercicios y las series; **Garmin** solo aporta pulso y calorías. No comparten ningún
+identificador, así que `ingest/link.py` los cruza por hora al final de cada pasada: a cada
+entreno de Hevy le asigna la actividad de Garmin que más se solapa con él, con 10 minutos
+de margen (`hevy_workouts.garmin_activity_id`). Un calentamiento en cinta justo antes
+queda como actividad aparte, porque se solapa menos.
+
+La vista `sesiones_fuerza` lo junta: título, duración, ejercicios, series y volumen (sin
+calentamientos) de Hevy, con `avg_hr`, `max_hr` y `calories` de Garmin. Si un entreno no
+tiene pareja, esas columnas salen `NULL`.
 
 El servicio sincroniza las dos cada `INGEST_INTERVAL_MIN` (360 por defecto). Son
 independientes: si una falla, la otra sigue, y el error queda en la tabla `sync_state`
@@ -66,6 +81,8 @@ hay que repetir `garmin-login` si `sync_state` muestra un error de MFA.
 docker compose run --rm ingesta python -m ingest status            # última pasada de cada fuente
 docker compose run --rm ingesta python -m ingest hevy [--full]
 docker compose run --rm ingesta python -m ingest garmin [--days N | --since YYYY-MM-DD]
+docker compose run --rm ingesta python -m ingest garmin --since YYYY-MM-DD --solo-actividades
+docker compose run --rm ingesta python -m ingest link              # recalcula el cruce Hevy-Garmin
 docker compose logs --tail 50 ingesta
 ```
 

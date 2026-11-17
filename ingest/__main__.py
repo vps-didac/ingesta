@@ -1,7 +1,9 @@
 """CLI de ingesta.
 
     python -m ingest hevy [--full]                 # incremental; --full rehace todo el historial
-    python -m ingest garmin [--days N | --since F] # incremental; o repasa un rango
+    python -m ingest garmin [--days N | --since F] [--solo-actividades]
+                                                   # incremental; o repasa un rango
+    python -m ingest link                          # recalcula el cruce Hevy-Garmin
     python -m ingest all                           # las dos, una vez
     python -m ingest loop                          # las dos cada INGEST_INTERVAL_MIN (el servicio del compose)
     python -m ingest garmin-login                  # login interactivo (MFA) y guarda tokens
@@ -39,9 +41,9 @@ def _hevy(full=False):
     return hevy.sync(full=full)
 
 
-def _garmin(days=None, since=None):
+def _garmin(days=None, since=None, solo_actividades=False):
     from ingest import garmin
-    return garmin.sync(days=days, since=since)
+    return garmin.sync(days=days, since=since, solo_actividades=solo_actividades)
 
 
 def cmd_loop() -> int:
@@ -74,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     rango = g.add_mutually_exclusive_group()
     rango.add_argument("--days", type=int, help="repasar los últimos N días")
     rango.add_argument("--since", help="repasar desde YYYY-MM-DD")
+    g.add_argument("--solo-actividades", action="store_true",
+                   help="solo actividades (una consulta), sin el resumen diario")
+    sub.add_parser("link")
     sub.add_parser("all")
     sub.add_parser("loop")
     sub.add_parser("garmin-login")
@@ -86,7 +91,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "hevy":
         return 0 if _run("hevy", lambda: _hevy(full=args.full)) else 1
     if args.cmd == "garmin":
-        return 0 if _run("garmin", lambda: _garmin(days=args.days, since=args.since)) else 1
+        return 0 if _run("garmin", lambda: _garmin(days=args.days, since=args.since,
+                                                    solo_actividades=args.solo_actividades)) else 1
+    if args.cmd == "link":
+        from ingest import link
+        return 0 if _run("link", link.link) else 1
     if args.cmd == "all":
         ok = [_run("hevy", _hevy), _run("garmin", _garmin)]
         return 0 if all(ok) else 1
