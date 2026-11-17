@@ -1,4 +1,11 @@
 # Fija las versiones con ==. Con despliegue continuo cada push reconstruye la
 # imagen en el VPS, así que una dependencia flotante significa que un día
 # cualquiera el servicio arranca con otra versión mayor sin que nadie lo pida.
-# El ejemplo de app.py solo usa la biblioteca estándar, así que esto va vacío.
+#
+# garminconnect 0.3.x pide Python >= 3.12 (de ahí la imagen 3.12). Si Garmin rompe
+# el login, lo normal es que lo arregle una versión nueva: súbela aquí y empuja.
+garminconnect==0.3.20
+curl_cffi==0.17.0
+ua-generator==2.1.9
+requests==2.34.2
+tzdata==2026.6

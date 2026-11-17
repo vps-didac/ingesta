@@ -1,121 +1,80 @@
-# plantilla-vps
+# ingesta
 
-Plantilla para proyectos que viven en el VPS: cada push a `main` pasa los tests y,
-si están en verde, se despliega solo. Pulsa **Use this template** y sigue los cinco
-pasos de abajo.
-
-Lo que trae:
+Trae los datos de **Hevy** y **Garmin Connect** a `personal_data.db`, la SQLite que el
+MCP del VPS ([vps-didac/mcp-server](https://github.com/vps-didac/mcp-server)) consulta
+con `query_personal_db`. Cada push a `main` pasa los tests y se despliega solo, como el
+resto de proyectos del VPS (creado desde `plantilla-vps`).
 
 ```
-.github/workflows/deploy.yml   # tests + Tailscale + SSH al VPS. No hay que tocarlo.
-deploy.sh                      # cómo se levanta ESTE proyecto. Lo ejecuta el VPS.
-Dockerfile                     # dependencias primero, para que el rebuild sea rápido
-docker-compose.yml             # esqueleto del servicio
-app.py                         # servicio de ejemplo con /healthz: bórralo
-secrets.env.example            # plantilla del archivo de secretos del VPS
-vps/dispatcher.sh              # el /home/ubuntu/bin/deploy.sh del VPS (ver abajo)
+ingest/
+├── db.py          # esquema de la BD + migración. Este repo es su dueño.
+├── hevy.py        # API oficial de Hevy → hevy_sets
+├── garmin.py      # garminconnect → garmin_daily + cardio_activities
+├── common.py      # zona horaria, sync_state
+└── __main__.py    # CLI: python -m ingest ...
+scripts/test_ingest.py   # CI: la ingesta escribe bien, sin red
 ```
 
-## Estrenar un proyecto
+## Reparto con el MCP
 
-**1. Crea el repo** desde esta plantilla. Tiene que ser **público**: la organización
-está en plan Free y los secretos de organización solo los leen repos públicos. No
-escribas credenciales en el código; para eso está `secrets.env`.
+| | ingesta (este repo) | mcp-server |
+|---|---|---|
+| BD | crea las tablas, migra y escribe | la abre en solo lectura (`mode=ro`) |
+| Volumen | `/home/ubuntu/apps/lab-ai/data` → `/data` | el mismo |
+| Python | 3.12 (lo pide `garminconnect`) | el suyo |
 
-**2. Ajusta tres cosas** y empuja a `main`:
+Si cambias una tabla en `ingest/db.py`, actualiza la docstring de `query_personal_db` en
+`tools/health_db.py` del MCP: es lo que le dice al modelo qué columnas hay.
 
-- `docker-compose.yml`: el `container_name` (vale el nombre del repo) y lo que necesite
-  el servicio.
-- `deploy.sh`: la variable `HEALTH_URL`, o vacíala si el proyecto no expone HTTP.
-- `.github/workflows/deploy.yml`: el paso del healthcheck y, si hay tests, el hueco
-  que ya está comentado.
+## Fuentes
 
-**3. Clónalo en el VPS**, en `apps/projects/` y con el nombre exacto del repositorio:
-es así como lo encuentra el despachador.
+- **Hevy**: API pública oficial, **requiere Hevy Pro**. Incremental por
+  `/v1/workouts/events`: recoge entrenos nuevos, editados y borrados. Un entreno editado
+  se reescribe entero. La primera pasada trae todo el historial.
+- **Garmin**: no hay API pública para particulares; se usa
+  [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) 0.3.x, que se
+  autentica como la app de Android. Cada pasada repasa los últimos días (el sueño y el HRV
+  se completan con retraso) y las actividades del mismo rango, salvo las de fuerza, que ya
+  vienen de Hevy. **Es la pieza frágil**: si Garmin cambia el login, se rompe hasta que
+  salga una versión nueva de la librería. Se arregla subiéndola en `requirements.txt`.
+
+El servicio sincroniza las dos cada `INGEST_INTERVAL_MIN` (360 por defecto). Son
+independientes: si una falla, la otra sigue, y el error queda en la tabla `sync_state`
+(visible desde el MCP con la herramienta `ingest_status`). Todo es idempotente: repetir
+una pasada no duplica nada.
+
+## Puesta en marcha en el VPS (una vez)
 
 ```bash
 cd /home/ubuntu/apps/projects
-git clone https://github.com/vps-didac/<nombre-del-repo>.git
-cd <nombre-del-repo>
-cp secrets.env.example secrets.env && chmod 600 secrets.env   # aunque quede vacío
-```
-
-**4. Pruébalo a mano** antes de fiarte de Actions:
-
-```bash
+git clone https://github.com/vps-didac/ingesta.git
+cd ingesta
+cp secrets.env.example secrets.env && chmod 600 secrets.env
+nano secrets.env                                            # HEVY_API_KEY, GARMIN_EMAIL, GARMIN_PASSWORD
+docker compose build
+docker compose run --rm ingesta python -m ingest garmin-login     # pide el código MFA si lo hay
+docker compose run --rm ingesta python -m ingest garmin --days 365  # histórico (opcional)
 ./deploy.sh
 ```
 
-**5. Empuja algo a `main`** y mira la pestaña Actions. A partir de ahí, solo.
+Los tokens de Garmin quedan en `/data/garmin_tokens` (0600) y se refrescan solos. Solo
+hay que repetir `garmin-login` si `sync_state` muestra un error de MFA.
 
-## Cómo funciona
-
-```
-push a main
-  └─ job test: construye la imagen, la arranca y comprueba el healthcheck
-      └─ job deploy: entra en el tailnet (tag:ci) y hace
-           ssh -p 2222 $VPS_USER@$VPS_HOST "<nombre-del-repo>"
-            └─ la clave tiene comando forzado: no da shell, solo acepta ese nombre
-                └─ /home/ubuntu/bin/deploy.sh: git reset --hard origin/main
-                    └─ ./deploy.sh del repo: compose up --build + healthcheck
-```
-
-El despachador actualiza el código **antes** de ejecutar el `deploy.sh` del repo, así
-que el script que corre siempre es el recién traído. Y como el `deploy.sh` de cada
-proyecto decide cómo se levanta, cambiar el despliegue es un commit, no entrar al VPS.
-
-Secretos (de organización, visibilidad "Public repositories", ya configurados):
-
-| Secreto | Para qué |
-|---|---|
-| `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` | Cliente OAuth de Tailscale con `tag:ci` |
-| `VPS_HOST` / `VPS_USER` | Destino del SSH |
-| `VPS_SSH_KEY` | Clave privada del deploy, con comando forzado en el VPS |
-| `VPS_KNOWN_HOSTS` | Huella del host, para no desactivar la verificación |
-
-## Puesta a punto del VPS (una sola vez, no por proyecto)
-
-`vps/dispatcher.sh` es la versión que espera esta plantilla: igual que la que ya hay,
-pero ejecutando el `deploy.sh` del repo cuando existe. Instalarla:
+## CLI
 
 ```bash
-install -m 755 vps/dispatcher.sh /home/ubuntu/bin/deploy.sh
+docker compose run --rm ingesta python -m ingest status            # última pasada de cada fuente
+docker compose run --rm ingesta python -m ingest hevy [--full]
+docker compose run --rm ingesta python -m ingest garmin [--days N | --since YYYY-MM-DD]
+docker compose logs --tail 50 ingesta
 ```
 
-Y la clave de CI tiene que apuntar ahí. Si en `~/.ssh/authorized_keys` hay una entrada
-con una ruta concreta en vez del despachador, el repo que la use desplegará siempre ese
-proyecto, pase el nombre que pase:
+En local: `pip install -r requirements.txt && python scripts/test_ingest.py`.
 
-```
-# mal: ignora el nombre del repo
-command="bash /home/ubuntu/apps/lab-ai/mcp-server/deploy.sh" ... ssh-ed25519 AAAA...
+## Trampas
 
-# bien: enruta por nombre
-from="100.64.0.0/10",command="/home/ubuntu/bin/deploy.sh",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...
-```
-
-## Cosas que duelen una vez
-
-- **El archivo de secretos no puede llamarse `.env`.** Si el compose monta el directorio
-  dentro del contenedor, hay librerías (pydantic-settings, y por tanto fastmcp) que
-  auto-parsean cualquier `.env` del directorio de trabajo. Y si el contenedor corre con
-  `user:` distinto del dueño del archivo, un `.env` con permisos 600 lo mata al arrancar.
-- **Fija las versiones con `==`.** Cada despliegue reconstruye la imagen: con rangos
-  abiertos, el servicio cambia de versión el día menos pensado y sin avisar.
-- **El contenedor corre como uid 1000 si lo pides, pero el usuario del VPS es el 1001.**
-  Cuidado al montar volúmenes y escribir en ellos.
-- **`docker compose up -d --build` vale para todo.** Si solo cambió código, reutiliza las
-  capas y reinicia en segundos; si cambiaron las dependencias, reconstruye.
-
-## Diagnóstico
-
-| Síntoma en Actions | Causa probable |
-|---|---|
-| `no está habilitado en el VPS` | Falta el clon en `/home/ubuntu/apps/projects/<nombre>` |
-| `deploy.sh: No such file or directory` | La clave apunta a una ruta fija en vez del despachador |
-| `env file ... not found` | Falta `secrets.env` junto al `docker-compose.yml` |
-| El paso de Tailscale falla | El cliente OAuth no tiene permiso sobre `tag:ci` en la ACL |
-| `Host key verification failed` | `VPS_KNOWN_HOSTS` no cubre el 2222 (`ssh-keyscan -p 2222 <host>`) |
-| `Permission denied (publickey)` | La pública de `VPS_SSH_KEY` no está en `authorized_keys` |
-
-El historial de despliegues del VPS está en `~/deploy.log`.
+- **Secretos en `secrets.env`, nunca `.env`** y nunca en el código: el repo es público.
+- **uid 1000 en el contenedor, 1001 en el VPS.** La carpeta de datos ya la escribe el MCP
+  con el 1000, por eso este servicio usa el mismo.
+- **Versiones fijadas con `==`.** Con más motivo aquí: una versión nueva de
+  `garminconnect` puede arreglar o romper el login.

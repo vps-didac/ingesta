@@ -9,10 +9,9 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-# URL que debe responder para dar el despliegue por bueno. Déjala vacía si este
-# proyecto no expone HTTP. Cualquier respuesta vale: un 401 o un 406 significan
-# que el servicio está vivo, y es 000 lo que indica que no hay nadie escuchando.
-HEALTH_URL="http://127.0.0.1:8000/healthz"
+# La ingesta no expone HTTP: en vez de un healthcheck por URL, más abajo se
+# comprueba que el contenedor sigue en pie unos segundos después de arrancar.
+HEALTH_URL=""
 
 if [ -f secrets.env.example ] && [ ! -f secrets.env ]; then
   echo "ERROR: falta secrets.env. Cópialo de secrets.env.example y rellénalo." >&2
@@ -41,4 +40,19 @@ if [ -n "$HEALTH_URL" ] && [ "$code" = "000" ]; then
   exit 1
 fi
 [ -n "$HEALTH_URL" ] && echo "OK: el servicio responde (HTTP $code)."
+
+# Si el proceso muere al arrancar (import roto, BD ilegible...), Docker lo
+# reinicia en bucle y "up" habría dado verde igual. Un fallo de Hevy o Garmin
+# NO tumba el contenedor: queda en sync_state y en los logs.
+antes="$(docker inspect -f '{{.RestartCount}}' ingesta)"
+sleep 15
+estado="$(docker inspect -f '{{.State.Status}}' ingesta)"
+despues="$(docker inspect -f '{{.RestartCount}}' ingesta)"
+echo "==> Contenedor: $estado, reinicios $antes -> $despues"
+if [ "$estado" != "running" ] || [ "$despues" != "$antes" ]; then
+  echo "ERROR: el contenedor ingesta no sigue en pie tras arrancar." >&2
+  docker compose logs --tail 50
+  exit 1
+fi
+echo "OK: la ingesta está en marcha."
 exit 0

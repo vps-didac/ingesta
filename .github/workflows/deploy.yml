@@ -16,35 +16,25 @@ permissions:
 
 jobs:
   test:
-    name: La imagen construye y el servicio arranca
+    name: Tests de la ingesta y la imagen construye
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      # Aquí es donde van los tests del proyecto, si los tiene. Por ejemplo:
-      #   - uses: actions/setup-python@v7
-      #     with: { python-version: "3.11", cache: pip }
-      #   - run: pip install -r requirements-dev.txt
-      #   - run: python -m pytest -q
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
 
-      - name: Construir y arrancar
+      - run: pip install -r requirements.txt
+
+      - name: La ingesta escribe bien (sin red, respuestas falsas)
+        run: python scripts/test_ingest.py
+
+      - name: La imagen construye y el CLI arranca dentro
         run: |
           docker build -t ci-imagen:test .
-          docker run -d --name ci-contenedor --network host ci-imagen:test
-
-      - name: Responde al healthcheck
-        run: |
-          for i in $(seq 1 30); do
-            code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8000/healthz || true)"
-            if [ "$code" != "000" ]; then
-              echo "El servicio responde (HTTP $code)"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "::error::El servicio no respondió en 30 s"
-          docker logs ci-contenedor
-          exit 1
+          docker run --rm -e DB_PATH=/tmp/ci.db ci-imagen:test python -m ingest status
 
   deploy:
     name: Desplegar en el VPS

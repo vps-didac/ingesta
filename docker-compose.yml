@@ -1,27 +1,25 @@
 services:
-  app:
+  ingesta:
     build: .
-    container_name: CAMBIAME            # mismo nombre que el repo, va bien
+    container_name: ingesta
     restart: unless-stopped
-
-    # host = el contenedor comparte la red del VPS y el servicio queda en
-    # 127.0.0.1:8000 / tailnet. Si prefieres aislarlo, quita esta línea y
-    # descomenta el bloque ports.
+    # uid del contenedor del MCP: ya es el que crea y escribe la BD en el volumen
+    user: "1000:1000"
+    # Solo sale a Internet (Hevy y Garmin); no escucha en ningún puerto.
     network_mode: host
-    # ports:
-    #   - "127.0.0.1:8000:8000"
-
     mem_limit: 256m
 
     environment:
-      PORT: "8000"
+      TZ: Europe/Madrid            # a qué día pertenece un entreno y qué es "hoy"
+      DB_PATH: /data/personal_data.db
+      INGEST_INTERVAL_MIN: "360"
+      GARMIN_TOKENSTORE: /data/garmin_tokens
+      HOME: /tmp                   # que ninguna librería intente escribir en /
 
-    # Secretos: archivo sin seguimiento junto a este compose, solo en el VPS.
-    # Lo lee docker compose en el host y al contenedor solo le llegan las
-    # variables. No lo llames .env: hay librerías que auto-parsean cualquier
-    # .env que encuentren en el directorio de trabajo.
+    # HEVY_API_KEY, GARMIN_EMAIL, GARMIN_PASSWORD. Archivo sin seguimiento, solo en el VPS.
     env_file:
       - secrets.env
 
-    # volumes:
-    #   - /home/ubuntu/apps/datos/CAMBIAME:/datos
+    # La misma carpeta que monta el MCP (vps-didac/mcp-server) en /data. Él solo lee.
+    volumes:
+      - /home/ubuntu/apps/lab-ai/data:/data
