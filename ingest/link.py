@@ -26,8 +26,13 @@ def emparejar(workouts: list[tuple], actividades: list[tuple]) -> dict[str, str 
 
     Candidatas: las que se solapan con el entreno ampliado MARGIN por cada lado. Gana
     la de mayor solapamiento real (que puede ser negativo, si solo entra por el margen).
+
+    Una actividad va a un solo entreno: si dos entrenos seguidos de Hevy caen en la
+    misma actividad de Garmin (p. ej. un bloque corto de isométricos y luego el
+    entreno principal), se la queda el que más se solapa y el otro queda sin pareja.
+    Si no, sus calorías se contarían dos veces.
     """
-    pares = {}
+    pares, solapes = {}, {}
     for wid, w_ini, w_fin in workouts:
         mejor, mejor_solape = None, None
         for aid, a_ini, a_fin in actividades:
@@ -37,7 +42,13 @@ def emparejar(workouts: list[tuple], actividades: list[tuple]) -> dict[str, str 
             if mejor_solape is None or solape > mejor_solape:
                 mejor, mejor_solape = aid, solape
         pares[wid] = mejor
-    return pares
+        solapes[wid] = mejor_solape
+
+    duenyo = {}  # actividad → entreno que más se solapa con ella
+    for wid, aid in pares.items():
+        if aid and (aid not in duenyo or solapes[wid] > solapes[duenyo[aid]]):
+            duenyo[aid] = wid
+    return {wid: (aid if aid and duenyo[aid] == wid else None) for wid, aid in pares.items()}
 
 
 def link() -> int:

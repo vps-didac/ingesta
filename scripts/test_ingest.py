@@ -180,6 +180,16 @@ def main() -> int:
     link.link()
     check(db.fetch_all("SELECT COUNT(*) n FROM sesiones_fuerza")[0]["n"] == 1, "borrar en Hevy quita la sesión")
 
+    # Caso real (31-08-2026): dos entrenos seguidos en Hevy y una sola actividad en
+    # Garmin. Se la queda el que más se solapa; si no, las kcal contarían doble.
+    from datetime import datetime as _dt
+    t = lambda h: _dt.fromisoformat(f"2026-08-31T{h}:00+00:00")
+    pares = link.emparejar(
+        [("iso", t("13:21"), t("13:33")), ("pull", t("13:33"), t("15:21"))],
+        [("g", t("13:34"), t("15:24"))],
+    )
+    check(pares == {"iso": None, "pull": "g"}, "una actividad de Garmin va a un solo entreno de Hevy")
+
     r = garmin.sync(since="2026-11-10", solo_actividades=True)
     check(r["days"] == 0 and r["activities"] == 3, "--solo-actividades no pide el resumen diario")
 
