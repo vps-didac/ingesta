@@ -12,7 +12,13 @@ services:
     environment:
       TZ: Europe/Madrid            # a qué día pertenece un entreno y qué es "hoy"
       DB_PATH: /data/personal_data.db
-      INGEST_INTERVAL_MIN: "360"
+      # Franjas fijas (Hevy + Garmin). Ver ingest/agenda.py
+      INGEST_HORAS: "09:00,12:00,17:00,22:00"
+      # Tras la primera franja, sin el sueño de hoy: Garmin cada 15 min, o cada 60 si
+      # ya hay uso de esa madrugada (>= 1500 pasos: el reloj sube datos pero no la noche)
+      INGEST_REINTENTO_MIN: "15"
+      INGEST_REINTENTO_USO_MIN: "60"
+      INGEST_PASOS_USO: "1500"
       GARMIN_TOKENSTORE: /data/garmin_tokens
       HOME: /tmp                   # que ninguna librería intente escribir en /
 

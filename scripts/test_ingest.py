@@ -196,6 +196,39 @@ def main() -> int:
     estado = {r["source"]: r for r in db.fetch_all("SELECT * FROM sync_state")}
     check(estado["garmin"]["last_error"] is None and estado["garmin"]["cursor"], "sync_state apunta la pasada de Garmin")
 
+    # --- Agenda: franjas y reintentos de la mañana
+    from datetime import datetime as _dt2, time as _t, timedelta as _td
+    from ingest import __main__ as cli
+    from ingest.agenda import Agenda
+    from ingest.common import TZ
+    a = Agenda([_t(9), _t(12), _t(17), _t(22)])
+    en = lambda h, m=0: _dt2(2026, 11, 18, h, m, tzinfo=TZ)  # noqa: E731
+    check(a.franja_pendiente(en(8, 59)) is None and a.franja_pendiente(en(9, 0)) == _t(9),
+          "la primera franja es a las 9:00")
+    check(not a.toca_reintento(en(8, 30), True), "antes de la franja de las 9 no se reintenta")
+    a.marcar(en(9, 0), _t(9))
+    check(a.franja_pendiente(en(9, 1)) is None, "una franja hecha no se repite")
+    check(a.toca_reintento(en(9, 1), True) and not a.toca_reintento(en(9, 1), False),
+          "tras las 9, se reintenta solo si falta el sueño")
+    check(a.programar_reintento(en(9, 1), 300) == en(9, 16), "sin uso de madrugada: cada 15 min")
+    check(not a.toca_reintento(en(9, 10), True) and a.toca_reintento(en(9, 16), True), "respeta el intervalo")
+    check(a.programar_reintento(en(9, 16), 4200) == en(10, 16), "con pasos de madrugada: cada hora")
+    check(not a.toca_reintento(en(22, 0), True), "en la última franja dejan de reintentarse")
+    check(a.franja_pendiente(en(13, 30)) == _t(12) and a.franja_pendiente(en(14, 30)) is None,
+          "una franja se recupera hasta 2 h tarde, no más")
+    b = Agenda([_t(9), _t(12)])
+    b.marcar_vigentes(en(10, 0))
+    check(b.franja_pendiente(en(10, 1)) is None, "la pasada al arrancar cuenta como la franja en curso")
+
+    ahora = _dt2.now(TZ)
+    falta, _ = cli._sueno_y_pasos_hoy(ahora)
+    check(not falta, "con el sueño de hoy en la BD no se reintenta")
+    with db.connect(readonly=False) as conn:
+        conn.execute("UPDATE garmin_daily SET sleep_score = NULL, sleep_hours = NULL WHERE date = ?",
+                     (ahora.date().isoformat(),))
+    check(cli._sueno_y_pasos_hoy(ahora) == (True, 9876), "sin sueño de hoy: falta, con sus pasos")
+    check(cli._sueno_y_pasos_hoy(ahora + _td(days=30)) == (True, None), "un día sin fila cuenta como sin sueño")
+
     print("OK: la ingesta escribe lo que debe.")
     return 0
 

@@ -53,7 +53,18 @@ La vista `sesiones_fuerza` lo junta: título, duración, ejercicios, series y vo
 calentamientos) de Hevy, con `avg_hr`, `max_hr` y `calories` de Garmin. Si un entreno no
 tiene pareja, esas columnas salen `NULL`.
 
-El servicio sincroniza las dos cada `INGEST_INTERVAL_MIN` (360 por defecto). Son
+### Cuándo se sincroniza (`ingest/agenda.py`)
+
+- **Franjas fijas** (`INGEST_HORAS`): 09:00, 12:00, 17:00 y 22:00, Hevy + Garmin. Si el
+  servicio estaba parado a esa hora, la franja se hace al arrancar (hasta 2 h tarde).
+- **Sueño de la mañana**: después de la franja de las 9, mientras no haya sueño de hoy,
+  se repasa solo Garmin de hoy cada 15 min; si ya hay uso de esa madrugada (≥ 1500
+  pasos), cada hora. Para al llegar el sueño o en la última franja.
+- **Sin webhooks por ahora.** Garmin no los ofrece para uso personal (el push es solo
+  para empresas). Hevy sí tiene (`POST /v1/webhook-subscription`, una URL por cuenta),
+  pero de momento sus entrenos entran en las franjas.
+
+Las dos fuentes son
 independientes: si una falla, la otra sigue, y el error queda en la tabla `sync_state`
 (visible desde el MCP con la herramienta `ingest_status`). Todo es idempotente: repetir
 una pasada no duplica nada.

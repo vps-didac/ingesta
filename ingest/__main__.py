@@ -5,7 +5,7 @@
                                                    # incremental; o repasa un rango
     python -m ingest link                          # recalcula el cruce Hevy-Garmin
     python -m ingest all                           # las dos, una vez
-    python -m ingest loop                          # las dos cada INGEST_INTERVAL_MIN (el servicio del compose)
+    python -m ingest loop                          # el servicio del compose: franjas de ingest/agenda.py
     python -m ingest garmin-login                  # login interactivo (MFA) y guarda tokens
     python -m ingest status                        # qué tal fue la última pasada de cada una
 
@@ -17,12 +17,13 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 
 from ingest import db
 from ingest.db import DB_PATH
-from ingest.common import IngestError, log
+from ingest.common import TZ, IngestError, log
 
-INTERVAL_MIN = int(os.environ.get("INGEST_INTERVAL_MIN", "360"))
+ESPERA_S = 60   # cada cuánto mira el bucle si toca algo
 
 
 def _run(nombre: str, fn) -> bool:
@@ -46,12 +47,62 @@ def _garmin(days=None, since=None, solo_actividades=False):
     return garmin.sync(days=days, since=since, solo_actividades=solo_actividades)
 
 
+def _sueno_y_pasos_hoy(ahora: datetime) -> tuple[bool, int | None]:
+    """(falta el sueño de hoy, pasos de hoy)."""
+    filas = db.fetch_all("SELECT sleep_score, sleep_hours, steps FROM garmin_daily WHERE date = ?",
+                         (ahora.date().isoformat(),))
+    if not filas:
+        return True, None
+    f = filas[0]
+    return f["sleep_score"] is None and f["sleep_hours"] is None, f["steps"]
+
+
+def _completa() -> None:
+    _run("hevy", _hevy)
+    _run("garmin", _garmin)
+
+
 def cmd_loop() -> int:
-    log.info("Ingesta en bucle cada %s min (BD %s)", INTERVAL_MIN, DB_PATH)
+    from ingest.agenda import Agenda
+
+    agenda = Agenda()
+    log.info("Ingesta: franjas %s; reintentos de sueño cada %s / %s si ya hay uso (BD %s)",
+             ", ".join(h.strftime("%H:%M") for h in agenda.horas),
+             agenda.intervalo_reintento(0), agenda.intervalo_reintento(10**9), DB_PATH)
+
+    def _tras_completa() -> None:
+        """Si tras una pasada completa sigue faltando el sueño, el primer reintento va
+        a un intervalo de distancia (no un minuto después)."""
+        ahora = datetime.now(TZ)
+        falta, pasos = _sueno_y_pasos_hoy(ahora)
+        if falta:
+            agenda.programar_reintento(ahora, pasos)
+
+    # Pasada al arrancar (o tras un despliegue): deja la BD al día y cuenta como la franja en curso
+    _completa()
+    agenda.marcar_vigentes(datetime.now(TZ))
+    _tras_completa()
+
     while True:
-        _run("hevy", _hevy)
-        _run("garmin", _garmin)
-        time.sleep(INTERVAL_MIN * 60)
+        time.sleep(ESPERA_S)
+        ahora = datetime.now(TZ)
+        if (franja := agenda.franja_pendiente(ahora)) is not None:
+            log.info("Franja de las %s", franja.strftime("%H:%M"))
+            _completa()
+            agenda.marcar(ahora, franja)
+            _tras_completa()
+            continue
+
+        falta_sueno, pasos = _sueno_y_pasos_hoy(ahora)
+        if agenda.toca_reintento(ahora, falta_sueno):
+            _run("garmin", lambda: _garmin(days=1))
+            falta_sueno, pasos = _sueno_y_pasos_hoy(datetime.now(TZ))
+            if falta_sueno:
+                siguiente = agenda.programar_reintento(datetime.now(TZ), pasos)
+                log.info("Sin sueño de hoy todavía (pasos: %s). Siguiente intento a las %s",
+                         pasos, siguiente.strftime("%H:%M"))
+            else:
+                log.info("Sueño de hoy recibido")
 
 
 def cmd_status() -> int:
